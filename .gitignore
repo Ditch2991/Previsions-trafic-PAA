@@ -1,8 +1,7 @@
-﻿__pycache__/
-*.pyc
-.venv/
-venv/
-env/
+﻿data/
+*.xlsx
+*.csv
+app_old.py*
+__pycache__/
 .ipynb_checkpoints/
 .streamlit/
-.DS_Store
