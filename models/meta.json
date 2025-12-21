@@ -1,0 +1,10 @@
+{
+  "features": [
+    "lag_1",
+    "lag_12",
+    "roll_mean_3"
+  ],
+  "best_alpha": 0.4452048365748854,
+  "cutoff_date": "2024-01-01",
+  "notes": "Ridge pipeline: StandardScaler + Ridge. Fitted on X_train (<2024)."
+}

@@ -2,6 +2,9 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import joblib
+import json
+from pathlib import Path
 
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
@@ -114,16 +117,12 @@ def make_ml_frame(df_mensuel: pd.DataFrame) -> pd.DataFrame:
     return df_ml
 
 
-def train_ridge(df_ml_clean: pd.DataFrame, features: list[str], alpha: float) -> Pipeline:
-    X = df_ml_clean[features]
-    y = df_ml_clean["tonnage"].values
+# Charger modèle + meta
+model = joblib.load("models/ridge_best.joblib")
+meta = json.loads(Path("models/meta.json").read_text(encoding="utf-8"))
+features = meta["features"]
+best_alpha = meta["best_alpha"]
 
-    model = Pipeline([
-        ("scaler", StandardScaler()),
-        ("ridge", Ridge(alpha=alpha, random_state=42))
-    ])
-    model.fit(X, y)
-    return model
 
 
 def forecast_year_recursive(model: Pipeline, df_mensuel: pd.DataFrame, target_year: int) -> pd.DataFrame:
@@ -173,7 +172,7 @@ def forecast_year_recursive(model: Pipeline, df_mensuel: pd.DataFrame, target_ye
 with st.sidebar:
     st.header("Paramètres")
     uploaded = st.file_uploader("Charge le fichier Excel (.xlsx)", type=["xlsx"])
-    alpha = st.number_input("Alpha Ridge", min_value=0.0001, value=1.0, step=0.1, format="%.4f")
+    
     target_year = st.number_input("Année à prédire", min_value=1900, max_value=2100, value=2027, step=1)
 
     st.divider()
