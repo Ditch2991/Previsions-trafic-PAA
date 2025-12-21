@@ -6,16 +6,14 @@ import joblib
 import json
 from pathlib import Path
 
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import Ridge
+from sklearn.pipeline import Pipeline  # juste pour le type, ton modèle joblib est un Pipeline
 
 
 # ============================================================
 # CONFIG STREAMLIT
 # ============================================================
-st.set_page_config(page_title="Prévisions annuelles - Ridge", layout="wide")
-st.title("📈 Prévisions annuelles (12 mois) — Régression linéaire + Ridge")
+st.set_page_config(page_title="Prévisions annuelles - Ridge (PAA)", layout="wide")
+st.title("📈 Prévisions annuelles (12 mois) — Modèle Ridge (Pipeline sauvegardé)")
 st.caption("Excel (données brutes) → agrégation mensuelle → features (lag_1, lag_12, roll_mean_3) → prédictions.")
 
 
@@ -34,7 +32,7 @@ def load_excel_and_build_monthly_series(file):
     """
     df = pd.read_excel(file, sheet_name="Feuil1")
 
-    # Renommage des colonnes (comme dans ton notebook)
+    # Renommage des colonnes (comme ton notebook)
     df = df.rename(columns={
         "Sens trafic 2": "sens_trafic",
         "Transbordement": "transbordement",
@@ -117,15 +115,31 @@ def make_ml_frame(df_mensuel: pd.DataFrame) -> pd.DataFrame:
     return df_ml
 
 
-# Charger modèle + meta
-model = joblib.load("models/ridge_best.joblib")
-meta = json.loads(Path("models/meta.json").read_text(encoding="utf-8"))
-features = meta["features"]
-best_alpha = meta["best_alpha"]
+@st.cache_resource
+def load_model_and_meta():
+    """
+    Charge le modèle Ridge (Pipeline scaler+ridge) et meta.json depuis le dossier models/
+    Compatible Streamlit Cloud (chemins relatifs au fichier app.py).
+    """
+    base_dir = Path(__file__).resolve().parent
+    model_path = base_dir / "models" / "ridge_best.joblib"
+    meta_path = base_dir / "models" / "meta.json"
 
+    if not model_path.exists():
+        raise FileNotFoundError(f"Modèle introuvable: {model_path}")
+    if not meta_path.exists():
+        raise FileNotFoundError(f"Meta introuvable: {meta_path}")
+
+    model = joblib.load(model_path)
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    return model, meta
 
 
 def forecast_year_recursive(model: Pipeline, df_mensuel: pd.DataFrame, target_year: int) -> pd.DataFrame:
+    """
+    Prévision récursive avec features: lag_1, lag_12, roll_mean_3
+    IMPORTANT: les features doivent être les mêmes que lors de l'entraînement du modèle sauvegardé.
+    """
     history = df_mensuel.copy()
 
     start = pd.Timestamp(f"{target_year}-01-01").to_period("M").to_timestamp()
@@ -167,13 +181,29 @@ def forecast_year_recursive(model: Pipeline, df_mensuel: pd.DataFrame, target_ye
 
 
 # ============================================================
+# LOAD MODEL (cached)
+# ============================================================
+try:
+    model, meta = load_model_and_meta()
+    FEATURES = meta.get("features", ["lag_1", "lag_12", "roll_mean_3"])
+    BEST_ALPHA = meta.get("best_alpha", None)
+except Exception as e:
+    st.error(f"❌ Impossible de charger le modèle/meta depuis le dossier models/. Détail: {e}")
+    st.stop()
+
+
+# ============================================================
 # SIDEBAR
 # ============================================================
 with st.sidebar:
     st.header("Paramètres")
     uploaded = st.file_uploader("Charge le fichier Excel (.xlsx)", type=["xlsx"])
-    
     target_year = st.number_input("Année à prédire", min_value=1900, max_value=2100, value=2027, step=1)
+
+    if BEST_ALPHA is not None:
+        st.info(f"✅ Modèle chargé. Best alpha (RandomizedSearch) = {BEST_ALPHA:.6f}")
+    else:
+        st.info("✅ Modèle chargé. (best_alpha non trouvé dans meta.json)")
 
     st.divider()
     st.caption("Feuille attendue: 'Feuil1'. Colonnes attendues: Année, Mois, Somme de Tonne (au minimum).")
@@ -200,15 +230,15 @@ st.dataframe(hist_show.tail(36), use_container_width=True)
 if df_mensuel.shape[0] < 15:
     st.warning("⚠️ Série courte : idéalement ≥ 15 mois pour lag_12 et roll_mean_3. Résultats potentiellement instables.")
 
+# On construit les features uniquement pour vérifier qu'on a assez d'historique (dropna)
 df_ml = make_ml_frame(df_mensuel)
-features = ["lag_1", "lag_12", "roll_mean_3"]
-df_ml_clean = df_ml.dropna(subset=features + ["tonnage"]).copy()
+df_ml_clean = df_ml.dropna(subset=FEATURES + ["tonnage"]).copy()
 
 if df_ml_clean.empty:
     st.error("Pas assez de données après création des lags/rolling (dropna). Ajoute plus d'historique.")
     st.stop()
 
-model = train_ridge(df_ml_clean, features, float(alpha))
+# ICI: on n'entraîne PLUS. On utilise le modèle sauvegardé.
 pred_df = forecast_year_recursive(model, df_mensuel, int(target_year))
 
 c1, c2 = st.columns([1.2, 1])
@@ -232,3 +262,9 @@ with c2:
 st.divider()
 st.subheader("🔎 Aperçu des données brutes (après renommage)")
 st.dataframe(df_brut.head(25), use_container_width=True)
+
+with st.expander("🛠️ Infos modèle"):
+    st.write("Features attendues par le modèle:", FEATURES)
+    if BEST_ALPHA is not None:
+        st.write("Best alpha:", BEST_ALPHA)
+    st.write("Meta:", meta)
