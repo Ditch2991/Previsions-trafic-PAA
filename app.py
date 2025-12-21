@@ -135,15 +135,16 @@ def load_model_and_meta():
     return model, meta
 
 
-def forecast_year_recursive(model: Pipeline, df_mensuel: pd.DataFrame, target_year: int) -> pd.DataFrame:
+def forecast_until_year_end(model, df_mensuel: pd.DataFrame, target_year: int) -> pd.DataFrame:
     """
-    Prévision récursive avec features: lag_1, lag_12, roll_mean_3
-    IMPORTANT: les features doivent être les mêmes que lors de l'entraînement du modèle sauvegardé.
+    Forecast récursif depuis le mois suivant la dernière date observée
+    jusqu'à Décembre de target_year. Ensuite on renvoie TOUTES les prédictions.
     """
-    history = df_mensuel.copy()
+    history = df_mensuel.copy().sort_index()
+    last_obs = history.index.max()
 
-    start = pd.Timestamp(f"{target_year}-01-01").to_period("M").to_timestamp()
-    end = pd.Timestamp(f"{target_year}-12-01").to_period("M").to_timestamp()
+    start = (last_obs.to_period("M") + 1).to_timestamp()          # mois suivant
+    end = pd.Timestamp(f"{target_year}-12-01")                    # fin année cible
     future_index = pd.date_range(start=start, end=end, freq="MS")
 
     preds = []
@@ -170,12 +171,11 @@ def forecast_year_recursive(model: Pipeline, df_mensuel: pd.DataFrame, target_ye
 
         yhat = float(model.predict(X_future)[0])
         preds.append(yhat)
+
+        # Injecter la prévision pour les pas suivants
         history.loc[d, "tonnage"] = yhat
 
-    out = pd.DataFrame({
-        "date_mois": future_index,
-        "prediction_tonnage": preds
-    })
+    out = pd.DataFrame({"date_mois": future_index, "prediction_tonnage": preds})
     out["date_mois_str"] = out["date_mois"].dt.strftime("%Y-%m")
     return out
 
@@ -195,18 +195,15 @@ except Exception as e:
 # ============================================================
 # SIDEBAR
 # ============================================================
-with st.sidebar:
-    st.header("Paramètres")
-    uploaded = st.file_uploader("Charge le fichier Excel (.xlsx)", type=["xlsx"])
-    target_year = st.number_input("Année à prédire", min_value=1900, max_value=2100, value=2027, step=1)
+alpha = st.number_input(
+    "Alpha Ridge (best)",
+    min_value=0.0001,
+    value=float(best_alpha) if best_alpha is not None else 0.4452,
+    step=0.01,
+    format="%.4f",
+    disabled=True
+)
 
-    if BEST_ALPHA is not None:
-        st.info(f"✅ Modèle chargé. Best alpha (RandomizedSearch) = {BEST_ALPHA:.6f}")
-    else:
-        st.info("✅ Modèle chargé. (best_alpha non trouvé dans meta.json)")
-
-    st.divider()
-    st.caption("Feuille attendue: 'Feuil1'. Colonnes attendues: Année, Mois, Somme de Tonne (au minimum).")
 
 
 # ============================================================
@@ -239,7 +236,9 @@ if df_ml_clean.empty:
     st.stop()
 
 # ICI: on n'entraîne PLUS. On utilise le modèle sauvegardé.
-pred_df = forecast_year_recursive(model, df_mensuel, int(target_year))
+pred_all = forecast_until_year_end(model, df_mensuel, int(target_year))
+pred_df = pred_all[pred_all["date_mois"].dt.year == int(target_year)].copy()
+
 
 c1, c2 = st.columns([1.2, 1])
 
