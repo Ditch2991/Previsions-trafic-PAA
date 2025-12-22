@@ -1,0 +1,12 @@
+{
+  "features_resid_hw": [
+    "lag_1",
+    "lag_12",
+    "roll_mean_3",
+    "resid_hw_lag_1",
+    "resid_hw_lag_12"
+  ],
+  "ridge_alpha": 0.4452048365748854,
+  "seasonal_periods": 12,
+  "notes": "Hybrid: Holt-Winters base forecast + Ridge on HW residuals."
+}
