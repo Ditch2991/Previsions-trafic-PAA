@@ -78,7 +78,7 @@ def load_excel_and_build_monthly_series(file):
     df["tonnage"] = pd.to_numeric(df["tonnage"], errors="coerce")
     df = df.dropna(subset=["tonnage"])
 
-    # date mensuelle
+    # date mensuelle (début de mois)
     df["date_mois"] = pd.to_datetime(
         df["annee"].astype(str) + "-" + df["mois"].astype(str) + "-01",
         errors="coerce"
@@ -92,16 +92,9 @@ def load_excel_and_build_monthly_series(file):
           .to_frame()
           .sort_index()
     )
-    df_mensuel.index = df_mensuel.index.to_period("M").to_timestamp()
+    df_mensuel.index = df_mensuel.index.to_period("M").to_timestamp()  # MS
+
     return df, df_mensuel
-
-
-def make_ml_frame(df_mensuel: pd.DataFrame) -> pd.DataFrame:
-    df_ml = df_mensuel.copy()
-    df_ml["lag_1"] = df_ml["tonnage"].shift(1)
-    df_ml["lag_12"] = df_ml["tonnage"].shift(12)
-    df_ml["roll_mean_3"] = df_ml["tonnage"].rolling(3).mean()
-    return df_ml
 
 
 @st.cache_resource
@@ -120,14 +113,27 @@ def load_model_and_meta():
     return model, meta
 
 
-def forecast_until(model, df_mensuel: pd.DataFrame, months_ahead: int, features: list[str]) -> pd.DataFrame:
+def months_between_exclusive(start_month: pd.Timestamp, end_month: pd.Timestamp) -> int:
     """
-    Prévisions récursives 'months_ahead' à partir du dernier mois observé.
-    C'est cette logique qui permet de prédire 2027 puis 2040 différemment.
+    Nombre de mois entre start_month (exclu) et end_month (inclu),
+    avec start_month et end_month au format 'MS' (1er du mois).
+    Exemple: start=2024-08-01, end=2025-12-01 => 16 mois.
+    """
+    sp = start_month.to_period("M")
+    ep = end_month.to_period("M")
+    return (ep - sp).n
+
+
+def forecast_next_months(model, df_mensuel: pd.DataFrame, months_ahead: int) -> pd.DataFrame:
+    """
+    Prévisions récursives sur months_ahead mois, à partir du dernier mois observé.
     """
     history = df_mensuel.copy()
-    last_date = history.index.max()
-    future_index = pd.date_range(start=last_date + pd.offsets.MonthBegin(1), periods=months_ahead, freq="MS")
+    last_date = history.index.max().to_period("M").to_timestamp()  # MS
+
+    # On prédit à partir du mois suivant last_date, sur months_ahead périodes
+    start_future = (last_date.to_period("M") + 1).to_timestamp()
+    future_index = pd.date_range(start=start_future, periods=months_ahead, freq="MS")
 
     preds = []
     for d in future_index:
@@ -139,16 +145,16 @@ def forecast_until(model, df_mensuel: pd.DataFrame, months_ahead: int, features:
         lag_1 = float(history.loc[prev1, "tonnage"]) if prev1 in history.index else float(history["tonnage"].iloc[-1])
         lag_12 = float(history.loc[prev12, "tonnage"]) if prev12 in history.index else float(history["tonnage"].tail(12).mean())
 
-        last3 = []
+        vals = []
         for pm in [prev1, prev2, prev3]:
             if pm in history.index:
-                last3.append(float(history.loc[pm, "tonnage"]))
-        roll_mean_3 = float(np.mean(last3)) if len(last3) == 3 else float(history["tonnage"].tail(3).mean())
+                vals.append(float(history.loc[pm, "tonnage"]))
+        roll_mean_3 = float(np.mean(vals)) if len(vals) == 3 else float(history["tonnage"].tail(3).mean())
 
         X_future = pd.DataFrame({
             "lag_1": [lag_1],
             "lag_12": [lag_12],
-            "roll_mean_3": [roll_mean_3]
+            "roll_mean_3": [roll_mean_3],
         }, index=[d])
 
         yhat = float(model.predict(X_future)[0])
@@ -161,11 +167,10 @@ def forecast_until(model, df_mensuel: pd.DataFrame, months_ahead: int, features:
 
 
 # ============================================================
-# Charger modèle + meta (avant sidebar)
+# Charger modèle + meta
 # ============================================================
 try:
     model, meta = load_model_and_meta()
-    FEATURES = meta.get("features", ["lag_1", "lag_12", "roll_mean_3"])
     BEST_ALPHA = meta.get("best_alpha", None)
 except Exception as e:
     st.error(f"❌ Impossible de charger le modèle sauvegardé: {e}")
@@ -180,10 +185,12 @@ with st.sidebar:
     uploaded = st.file_uploader("Charge le fichier Excel (.xlsx)", type=["xlsx"])
 
     st.caption("Ton modèle est déjà entraîné et sauvegardé (joblib).")
-    st.write(f"**Best alpha (notebook)** : {BEST_ALPHA}" if BEST_ALPHA is not None else "**Best alpha** : (non trouvé)")
+    if BEST_ALPHA is not None:
+        st.write(f"**Best alpha (notebook)** : {BEST_ALPHA:.6f}")
+    else:
+        st.write("**Best alpha** : (non trouvé)")
 
     target_year = st.number_input("Année à prédire", min_value=2025, max_value=2100, value=2027, step=1)
-
     st.divider()
     st.caption("Feuille attendue: 'Feuil1'. Colonnes attendues: Année, Mois, Somme de Tonne (au minimum).")
 
@@ -206,31 +213,33 @@ hist_show = df_mensuel.copy()
 hist_show.index = hist_show.index.strftime("%Y-%m")
 st.dataframe(hist_show.tail(36), use_container_width=True)
 
-# Calcul horizon = du mois suivant le dernier observé jusqu'à décembre de target_year
-last_obs = df_mensuel.index.max()
+last_obs = df_mensuel.index.max().to_period("M").to_timestamp()
 end_target = pd.Timestamp(f"{int(target_year)}-12-01").to_period("M").to_timestamp()
 
 if end_target <= last_obs:
     st.warning(f"⚠️ Ton historique va déjà jusqu'à {last_obs:%Y-%m}. Choisis une année > {last_obs.year}.")
     st.stop()
 
-months_ahead = (end_target.to_period("M") - last_obs.to_period("M")).n
-
+months_ahead = months_between_exclusive(last_obs, end_target)
 st.info(f"Horizon calculé: **{months_ahead} mois** (de {last_obs:%Y-%m} → {end_target:%Y-%m})")
 
-# Construire df_ml juste pour contrôle data suffisante
-df_ml = make_ml_frame(df_mensuel)
-df_ml_clean = df_ml.dropna(subset=FEATURES + ["tonnage"]).copy()
+# Prévision jusqu'à décembre de l'année cible (incluse)
+pred_all = forecast_next_months(model, df_mensuel, months_ahead=months_ahead)
 
-if df_ml_clean.empty:
-    st.error("Pas assez de données après création des lags/rolling. Ajoute plus d'historique.")
-    st.stop()
+# Construire l'index exact Jan..Dec de l'année cible pour garantir 12 mois
+target_months = pd.date_range(start=f"{int(target_year)}-01-01", end=f"{int(target_year)}-12-01", freq="MS")
+pred_year = pred_all.set_index("date_mois").reindex(target_months).reset_index().rename(columns={"index": "date_mois"})
 
-# Prévision jusqu'à l'année cible
-pred_all = forecast_until(model, df_mensuel, months_ahead=months_ahead, features=FEATURES)
+# Vérification 12 mois
+missing_months = pred_year["prediction_tonnage"].isna().sum()
+if missing_months > 0:
+    st.warning(
+        f"⚠️ Il manque {missing_months} mois sur {target_year}. "
+        "Cela signifie que l'horizon n'a pas été généré jusqu'à décembre. "
+        "Vérifie le dernier mois observé dans ton Excel."
+    )
 
-# Extraire uniquement les 12 mois de l'année cible
-pred_year = pred_all[pred_all["date_mois"].dt.year == int(target_year)].copy()
+pred_year["date_mois_str"] = pred_year["date_mois"].dt.strftime("%Y-%m")
 
 c1, c2 = st.columns([1.2, 1])
 
