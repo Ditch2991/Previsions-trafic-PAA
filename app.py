@@ -113,15 +113,16 @@ def load_model_and_meta():
     return model, meta
 
 
-def months_between_exclusive(start_month: pd.Timestamp, end_month: pd.Timestamp) -> int:
+def months_ahead_to_reach(last_obs_ms: pd.Timestamp, end_target_ms: pd.Timestamp) -> int:
     """
-    Nombre de mois entre start_month (exclu) et end_month (inclu),
-    avec start_month et end_month au format 'MS' (1er du mois).
-    Exemple: start=2024-08-01, end=2025-12-01 => 16 mois.
+    Nombre de mois à prédire à partir du mois suivant last_obs_ms
+    pour atteindre end_target_ms inclus.
+    Ex: last_obs=2025-07-01, end_target=2026-12-01 -> 17 mois (Aug..Dec).
     """
-    sp = start_month.to_period("M")
-    ep = end_month.to_period("M")
-    return (ep - sp).n
+    lp = last_obs_ms.to_period("M")
+    ep = end_target_ms.to_period("M")
+    # mois futurs = (ep - lp) car on démarre le mois suivant
+    return (ep - lp).n
 
 
 def forecast_next_months(model, df_mensuel: pd.DataFrame, months_ahead: int) -> pd.DataFrame:
@@ -186,7 +187,7 @@ with st.sidebar:
 
     st.caption("Ton modèle est déjà entraîné et sauvegardé (joblib).")
     if BEST_ALPHA is not None:
-        st.write(f"**Best alpha (notebook)** : {BEST_ALPHA:.6f}")
+        st.write(f"**Best alpha (notebook)** : {float(BEST_ALPHA):.6f}")
     else:
         st.write("**Best alpha** : (non trouvé)")
 
@@ -213,6 +214,7 @@ hist_show = df_mensuel.copy()
 hist_show.index = hist_show.index.strftime("%Y-%m")
 st.dataframe(hist_show.tail(36), use_container_width=True)
 
+# Dates de référence (toujours MS)
 last_obs = df_mensuel.index.max().to_period("M").to_timestamp()
 end_target = pd.Timestamp(f"{int(target_year)}-12-01").to_period("M").to_timestamp()
 
@@ -220,26 +222,30 @@ if end_target <= last_obs:
     st.warning(f"⚠️ Ton historique va déjà jusqu'à {last_obs:%Y-%m}. Choisis une année > {last_obs.year}.")
     st.stop()
 
-months_ahead = months_between_exclusive(last_obs, end_target)
+months_ahead = months_ahead_to_reach(last_obs, end_target)
 st.info(f"Horizon calculé: **{months_ahead} mois** (de {last_obs:%Y-%m} → {end_target:%Y-%m})")
 
-# Prévision jusqu'à décembre de l'année cible (incluse)
+# 1) Prévision jusqu'à Décembre de l'année cible (incluse)
 pred_all = forecast_next_months(model, df_mensuel, months_ahead=months_ahead)
 
-# Construire l'index exact Jan..Dec de l'année cible pour garantir 12 mois
+# 2) Construire table complète = historique + futures
+pred_all = pred_all.set_index("date_mois")
+full_series = pd.concat([df_mensuel, pred_all.rename(columns={"prediction_tonnage": "tonnage"})[["tonnage"]]], axis=0)
+
+# 3) Extraire exactement Jan..Dec de l'année cible (12 mois garantis)
 target_months = pd.date_range(start=f"{int(target_year)}-01-01", end=f"{int(target_year)}-12-01", freq="MS")
-pred_year = pred_all.set_index("date_mois").reindex(target_months).reset_index().rename(columns={"index": "date_mois"})
-
-# Vérification 12 mois
-missing_months = pred_year["prediction_tonnage"].isna().sum()
-if missing_months > 0:
-    st.warning(
-        f"⚠️ Il manque {missing_months} mois sur {target_year}. "
-        "Cela signifie que l'horizon n'a pas été généré jusqu'à décembre. "
-        "Vérifie le dernier mois observé dans ton Excel."
-    )
-
+pred_year = full_series.reindex(target_months).rename(columns={"tonnage": "prediction_tonnage"}).reset_index()
+pred_year = pred_year.rename(columns={"index": "date_mois"})
 pred_year["date_mois_str"] = pred_year["date_mois"].dt.strftime("%Y-%m")
+
+# Si jamais certains mois sont encore NaN, c'est que l'horizon n'a pas atteint ces mois (ne devrait plus arriver)
+missing = int(pred_year["prediction_tonnage"].isna().sum())
+if missing > 0:
+    st.error(
+        f"❌ Il manque encore {missing} mois sur {target_year}. "
+        "Vérifie que le dernier mois observé (dans Excel) est bien interprété correctement."
+    )
+    st.stop()
 
 c1, c2 = st.columns([1.2, 1])
 
