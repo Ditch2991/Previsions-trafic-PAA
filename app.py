@@ -6,15 +6,12 @@ import joblib
 import json
 from pathlib import Path
 
-from sklearn.pipeline import Pipeline  # juste pour le type, ton modèle joblib est un Pipeline
-
-
 # ============================================================
 # CONFIG STREAMLIT
 # ============================================================
-st.set_page_config(page_title="Prévisions annuelles - Ridge (PAA)", layout="wide")
-st.title("📈 Prévisions annuelles (12 mois) — Modèle Ridge (Pipeline sauvegardé)")
-st.caption("Excel (données brutes) → agrégation mensuelle → features (lag_1, lag_12, roll_mean_3) → prédictions.")
+st.set_page_config(page_title="Prévisions annuelles - Ridge", layout="wide")
+st.title("📈 Prévisions annuelles (12 mois) — Modèle Ridge sauvegardé (joblib)")
+st.caption("Excel → agrégation mensuelle → features (lag_1, lag_12, roll_mean_3) → prédictions récursives.")
 
 
 # ============================================================
@@ -25,14 +22,8 @@ def _normalize_str(s: pd.Series) -> pd.Series:
 
 
 def load_excel_and_build_monthly_series(file):
-    """
-    Charge Excel (Feuil1), renomme les colonnes, gère mois en texte (Janvier...),
-    construit une série mensuelle du tonnage (somme).
-    Retourne: (df_brut_renomme, df_mensuel)
-    """
     df = pd.read_excel(file, sheet_name="Feuil1")
 
-    # Renommage des colonnes (comme ton notebook)
     df = df.rename(columns={
         "Sens trafic 2": "sens_trafic",
         "Transbordement": "transbordement",
@@ -51,14 +42,13 @@ def load_excel_and_build_monthly_series(file):
 
     df = df.dropna(subset=["annee", "mois", "tonnage"]).copy()
 
-    # Année robuste
+    # année robuste
     df["annee"] = pd.to_numeric(df["annee"], errors="coerce")
     df = df.dropna(subset=["annee"])
     df["annee"] = df["annee"].astype(int)
 
-    # Mois robuste (numérique ou texte FR)
+    # mois robuste (numérique ou FR)
     mois_raw = _normalize_str(df["mois"])
-
     mois_map = {
         "janvier": 1, "janv": 1, "jan": 1,
         "février": 2, "fevrier": 2, "févr": 2, "fevr": 2, "fév": 2, "fev": 2,
@@ -79,23 +69,23 @@ def load_excel_and_build_monthly_series(file):
     df["mois"] = mois_num.fillna(mois_mapped)
 
     if df["mois"].isna().any():
-        bad_examples = df.loc[df["mois"].isna(), "mois"].astype(str).head(10).tolist()
-        raise ValueError(f"Mois non reconnus (exemples): {bad_examples}. Corrige l'Excel ou complète le mapping.")
+        bad = df.loc[df["mois"].isna(), "mois"].astype(str).head(10).tolist()
+        raise ValueError(f"Mois non reconnus (exemples): {bad}")
 
     df["mois"] = df["mois"].astype(int)
 
-    # Tonnage robuste
+    # tonnage robuste
     df["tonnage"] = pd.to_numeric(df["tonnage"], errors="coerce")
     df = df.dropna(subset=["tonnage"])
 
-    # Date mensuelle
+    # date mensuelle
     df["date_mois"] = pd.to_datetime(
         df["annee"].astype(str) + "-" + df["mois"].astype(str) + "-01",
         errors="coerce"
     )
     df = df.dropna(subset=["date_mois"])
 
-    # Agrégation mensuelle (somme)
+    # agrégation mensuelle
     df_mensuel = (
         df.groupby("date_mois")["tonnage"]
           .sum()
@@ -103,7 +93,6 @@ def load_excel_and_build_monthly_series(file):
           .sort_index()
     )
     df_mensuel.index = df_mensuel.index.to_period("M").to_timestamp()
-
     return df, df_mensuel
 
 
@@ -117,10 +106,6 @@ def make_ml_frame(df_mensuel: pd.DataFrame) -> pd.DataFrame:
 
 @st.cache_resource
 def load_model_and_meta():
-    """
-    Charge le modèle Ridge (Pipeline scaler+ridge) et meta.json depuis le dossier models/
-    Compatible Streamlit Cloud (chemins relatifs au fichier app.py).
-    """
     base_dir = Path(__file__).resolve().parent
     model_path = base_dir / "models" / "ridge_best.joblib"
     meta_path = base_dir / "models" / "meta.json"
@@ -135,17 +120,14 @@ def load_model_and_meta():
     return model, meta
 
 
-def forecast_until_year_end(model, df_mensuel: pd.DataFrame, target_year: int) -> pd.DataFrame:
+def forecast_until(model, df_mensuel: pd.DataFrame, months_ahead: int, features: list[str]) -> pd.DataFrame:
     """
-    Forecast récursif depuis le mois suivant la dernière date observée
-    jusqu'à Décembre de target_year. Ensuite on renvoie TOUTES les prédictions.
+    Prévisions récursives 'months_ahead' à partir du dernier mois observé.
+    C'est cette logique qui permet de prédire 2027 puis 2040 différemment.
     """
-    history = df_mensuel.copy().sort_index()
-    last_obs = history.index.max()
-
-    start = (last_obs.to_period("M") + 1).to_timestamp()          # mois suivant
-    end = pd.Timestamp(f"{target_year}-12-01")                    # fin année cible
-    future_index = pd.date_range(start=start, end=end, freq="MS")
+    history = df_mensuel.copy()
+    last_date = history.index.max()
+    future_index = pd.date_range(start=last_date + pd.offsets.MonthBegin(1), periods=months_ahead, freq="MS")
 
     preds = []
     for d in future_index:
@@ -171,8 +153,6 @@ def forecast_until_year_end(model, df_mensuel: pd.DataFrame, target_year: int) -
 
         yhat = float(model.predict(X_future)[0])
         preds.append(yhat)
-
-        # Injecter la prévision pour les pas suivants
         history.loc[d, "tonnage"] = yhat
 
     out = pd.DataFrame({"date_mois": future_index, "prediction_tonnage": preds})
@@ -181,29 +161,31 @@ def forecast_until_year_end(model, df_mensuel: pd.DataFrame, target_year: int) -
 
 
 # ============================================================
-# LOAD MODEL (cached)
+# Charger modèle + meta (avant sidebar)
 # ============================================================
 try:
     model, meta = load_model_and_meta()
     FEATURES = meta.get("features", ["lag_1", "lag_12", "roll_mean_3"])
     BEST_ALPHA = meta.get("best_alpha", None)
 except Exception as e:
-    st.error(f"❌ Impossible de charger le modèle/meta depuis le dossier models/. Détail: {e}")
+    st.error(f"❌ Impossible de charger le modèle sauvegardé: {e}")
     st.stop()
 
 
 # ============================================================
 # SIDEBAR
 # ============================================================
-alpha = st.number_input(
-    "Alpha Ridge (best)",
-    min_value=0.0001,
-    value=float(best_alpha) if best_alpha is not None else 0.4452,
-    step=0.01,
-    format="%.4f",
-    disabled=True
-)
+with st.sidebar:
+    st.header("Paramètres")
+    uploaded = st.file_uploader("Charge le fichier Excel (.xlsx)", type=["xlsx"])
 
+    st.caption("Ton modèle est déjà entraîné et sauvegardé (joblib).")
+    st.write(f"**Best alpha (notebook)** : {BEST_ALPHA}" if BEST_ALPHA is not None else "**Best alpha** : (non trouvé)")
+
+    target_year = st.number_input("Année à prédire", min_value=2025, max_value=2100, value=2027, step=1)
+
+    st.divider()
+    st.caption("Feuille attendue: 'Feuil1'. Colonnes attendues: Année, Mois, Somme de Tonne (au minimum).")
 
 
 # ============================================================
@@ -224,46 +206,50 @@ hist_show = df_mensuel.copy()
 hist_show.index = hist_show.index.strftime("%Y-%m")
 st.dataframe(hist_show.tail(36), use_container_width=True)
 
-if df_mensuel.shape[0] < 15:
-    st.warning("⚠️ Série courte : idéalement ≥ 15 mois pour lag_12 et roll_mean_3. Résultats potentiellement instables.")
+# Calcul horizon = du mois suivant le dernier observé jusqu'à décembre de target_year
+last_obs = df_mensuel.index.max()
+end_target = pd.Timestamp(f"{int(target_year)}-12-01").to_period("M").to_timestamp()
 
-# On construit les features uniquement pour vérifier qu'on a assez d'historique (dropna)
+if end_target <= last_obs:
+    st.warning(f"⚠️ Ton historique va déjà jusqu'à {last_obs:%Y-%m}. Choisis une année > {last_obs.year}.")
+    st.stop()
+
+months_ahead = (end_target.to_period("M") - last_obs.to_period("M")).n
+
+st.info(f"Horizon calculé: **{months_ahead} mois** (de {last_obs:%Y-%m} → {end_target:%Y-%m})")
+
+# Construire df_ml juste pour contrôle data suffisante
 df_ml = make_ml_frame(df_mensuel)
 df_ml_clean = df_ml.dropna(subset=FEATURES + ["tonnage"]).copy()
 
 if df_ml_clean.empty:
-    st.error("Pas assez de données après création des lags/rolling (dropna). Ajoute plus d'historique.")
+    st.error("Pas assez de données après création des lags/rolling. Ajoute plus d'historique.")
     st.stop()
 
-# ICI: on n'entraîne PLUS. On utilise le modèle sauvegardé.
-pred_all = forecast_until_year_end(model, df_mensuel, int(target_year))
-pred_df = pred_all[pred_all["date_mois"].dt.year == int(target_year)].copy()
+# Prévision jusqu'à l'année cible
+pred_all = forecast_until(model, df_mensuel, months_ahead=months_ahead, features=FEATURES)
 
+# Extraire uniquement les 12 mois de l'année cible
+pred_year = pred_all[pred_all["date_mois"].dt.year == int(target_year)].copy()
 
 c1, c2 = st.columns([1.2, 1])
 
 with c1:
-    st.subheader("📋 Prédictions des 12 mois")
-    st.dataframe(pred_df[["date_mois_str", "prediction_tonnage"]], use_container_width=True)
+    st.subheader(f"📋 Prédictions des 12 mois — {int(target_year)}")
+    st.dataframe(pred_year[["date_mois_str", "prediction_tonnage"]], use_container_width=True)
 
-    csv_bytes = pred_df[["date_mois_str", "prediction_tonnage"]].to_csv(index=False).encode("utf-8")
+    csv_bytes = pred_year[["date_mois_str", "prediction_tonnage"]].to_csv(index=False).encode("utf-8")
     st.download_button(
         "⬇️ Télécharger les prédictions (CSV)",
         data=csv_bytes,
-        file_name=f"predictions_ridge_{target_year}.csv",
+        file_name=f"predictions_ridge_{int(target_year)}.csv",
         mime="text/csv"
     )
 
 with c2:
     st.subheader("📉 Courbe des prédictions")
-    st.line_chart(pred_df.set_index("date_mois")[["prediction_tonnage"]], height=320)
+    st.line_chart(pred_year.set_index("date_mois")[["prediction_tonnage"]], height=320)
 
 st.divider()
 st.subheader("🔎 Aperçu des données brutes (après renommage)")
 st.dataframe(df_brut.head(25), use_container_width=True)
-
-with st.expander("🛠️ Infos modèle"):
-    st.write("Features attendues par le modèle:", FEATURES)
-    if BEST_ALPHA is not None:
-        st.write("Best alpha:", BEST_ALPHA)
-    st.write("Meta:", meta)
