@@ -13,13 +13,11 @@ st.set_page_config(page_title="Prévisions annuelles - PAA", layout="wide")
 st.title("📈 Prévisions annuelles (12 mois) — PAA")
 st.caption("Choisir un modèle (Ridge ou Hybride Holt-Winters + Ridge) → charger Excel → prédire jusqu'à l'année choisie.")
 
-
 # ============================================================
 # HELPERS (DATA)
 # ============================================================
 def _normalize_str(s: pd.Series) -> pd.Series:
     return s.astype(str).str.strip().str.lower()
-
 
 def load_excel_and_build_monthly_series(file):
     df = pd.read_excel(file, sheet_name="Feuil1")
@@ -42,12 +40,10 @@ def load_excel_and_build_monthly_series(file):
 
     df = df.dropna(subset=["annee", "mois", "tonnage"]).copy()
 
-    # année robuste
     df["annee"] = pd.to_numeric(df["annee"], errors="coerce")
     df = df.dropna(subset=["annee"])
     df["annee"] = df["annee"].astype(int)
 
-    # mois robuste
     mois_raw = _normalize_str(df["mois"])
     mois_map = {
         "janvier": 1, "janv": 1, "jan": 1,
@@ -74,35 +70,29 @@ def load_excel_and_build_monthly_series(file):
 
     df["mois"] = df["mois"].astype(int)
 
-    # tonnage robuste
     df["tonnage"] = pd.to_numeric(df["tonnage"], errors="coerce")
     df = df.dropna(subset=["tonnage"])
 
-    # date mensuelle (début de mois)
     df["date_mois"] = pd.to_datetime(
         df["annee"].astype(str) + "-" + df["mois"].astype(str) + "-01",
         errors="coerce"
     )
     df = df.dropna(subset=["date_mois"])
 
-    # agrégation mensuelle
     df_mensuel = (
         df.groupby("date_mois")["tonnage"]
           .sum()
           .to_frame()
           .sort_index()
     )
-    df_mensuel.index = df_mensuel.index.to_period("M").to_timestamp()  # MS
+
+    # index = début de mois (MS)
+    df_mensuel.index = df_mensuel.index.to_period("M").to_timestamp()
 
     return df, df_mensuel
 
-
 def months_between_exclusive(start_month: pd.Timestamp, end_month: pd.Timestamp) -> int:
-    """Nombre de mois entre start (exclu) et end (inclu). start/end en MS."""
-    sp = start_month.to_period("M")
-    ep = end_month.to_period("M")
-    return (ep - sp).n
-
+    return (end_month.to_period("M") - start_month.to_period("M")).n
 
 # ============================================================
 # MODEL LOADING
@@ -122,7 +112,6 @@ def load_ridge_artifacts():
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
     return model, meta
 
-
 @st.cache_resource
 def load_hw_ridge_artifacts():
     base_dir = Path(__file__).resolve().parent
@@ -135,15 +124,19 @@ def load_hw_ridge_artifacts():
     missing = [p for p in [hw_model_path, ridge_resid_path, meta_path] if not p.exists()]
     if missing:
         raise FileNotFoundError(
-            f"Artefacts Hybride manquants dans: {folder}\n" +
-            "\n".join([f"- {p}" for p in missing])
+            f"Artefacts Hybride manquants dans: {folder}\n"
+            + "\n".join([f"- {p}" for p in missing])
         )
 
     hw_model = joblib.load(hw_model_path)
     ridge_resid = joblib.load(ridge_resid_path)
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
-    return hw_model, ridge_resid, meta
 
+    # normaliser clé
+    if "features_resid" not in meta and "features_resid_hw" in meta:
+        meta["features_resid"] = meta["features_resid_hw"]
+
+    return hw_model, ridge_resid, meta
 
 # ============================================================
 # FORECASTING: Ridge simple
@@ -162,11 +155,7 @@ def ridge_forecast_next_months(model, df_mensuel: pd.DataFrame, months_ahead: in
         prev12 = (d.to_period("M") - 12).to_timestamp()
 
         lag_1 = float(history.loc[prev1, "tonnage"]) if prev1 in history.index else float(history["tonnage"].iloc[-1])
-
-        if prev12 in history.index:
-            lag_12 = float(history.loc[prev12, "tonnage"])
-        else:
-            lag_12 = float(history["tonnage"].tail(12).mean())
+        lag_12 = float(history.loc[prev12, "tonnage"]) if prev12 in history.index else float(history["tonnage"].tail(12).mean())
 
         vals = [float(history.loc[x, "tonnage"]) for x in [prev1, prev2, prev3] if x in history.index]
         roll_mean_3 = float(np.mean(vals)) if len(vals) == 3 else float(history["tonnage"].tail(3).mean())
@@ -180,65 +169,79 @@ def ridge_forecast_next_months(model, df_mensuel: pd.DataFrame, months_ahead: in
     out["date_mois_str"] = out["date_mois"].dt.strftime("%Y-%m")
     return out
 
-
 # ============================================================
 # FORECASTING: Hybride HW + Ridge(residus)
 # ============================================================
-def _get_hw_fittedvalues(hw_model, history_index: pd.DatetimeIndex) -> pd.Series:
-    if not hasattr(hw_model, "fittedvalues"):
-        raise ValueError(
-            "Le modèle Holt-Winters chargé ne contient pas 'fittedvalues'. "
-            "Tu dois sauvegarder l'objet 'fit_hw' (results) et pas juste le modèle."
-        )
-    fv = hw_model.fittedvalues
-    fv = pd.Series(np.asarray(fv).reshape(-1), index=history_index).astype(float)
-    return fv
+def _as_series(x):
+    if isinstance(x, pd.Series):
+        return x
+    return pd.Series(x)
 
+def _get_hw_fittedvalues_aligned(hw_model, history_index: pd.DatetimeIndex) -> pd.Series:
+    """
+    Aligne fittedvalues HW sur l'index de df_mensuel sans erreur de longueur.
+    - Si fittedvalues a déjà un index daté: on reindex dessus.
+    - Sinon (array): on aligne sur la FIN de l'historique (valeurs généralement disponibles après init).
+    """
+    if not hasattr(hw_model, "fittedvalues"):
+        raise ValueError("Le modèle Holt-Winters chargé ne contient pas 'fittedvalues'.")
+
+    fv = _as_series(hw_model.fittedvalues)
+
+    # Cas 1: fittedvalues indexé par dates -> reindex direct
+    if isinstance(fv.index, (pd.DatetimeIndex, pd.PeriodIndex)):
+        if isinstance(fv.index, pd.PeriodIndex):
+            fv.index = fv.index.to_timestamp()
+        fv = fv.sort_index()
+        return fv.reindex(history_index)
+
+    # Cas 2: fittedvalues sans index (RangeIndex) -> aligner sur la fin
+    fv_values = fv.values.astype(float)
+    n = len(fv_values)
+    m = len(history_index)
+
+    if n > m:
+        # garder les m dernières
+        fv_values = fv_values[-m:]
+        n = m
+
+    # on place ces n valeurs sur les n derniers mois de history_index
+    aligned = pd.Series(index=history_index, dtype=float)
+    aligned.iloc[m - n:] = fv_values
+    return aligned
 
 def _hw_forecast(hw_model, steps: int, future_index: pd.DatetimeIndex) -> pd.Series:
-    if not hasattr(hw_model, "forecast"):
+    if hasattr(hw_model, "forecast"):
+        base = hw_model.forecast(steps=steps)
+    else:
         raise ValueError("Le modèle Holt-Winters chargé ne supporte pas .forecast(steps).")
-    base = hw_model.forecast(steps=steps)
-    return pd.Series(np.asarray(base).reshape(-1), index=future_index, name="base_hw").astype(float)
-
-
-def _safe_mean(series: pd.Series, k: int, default: float) -> float:
-    tail = series.dropna().tail(k)
-    return float(tail.mean()) if len(tail) > 0 else float(default)
-
+    return pd.Series(np.asarray(base, dtype=float), index=future_index, name="base_hw")
 
 def hw_ridge_forecast_next_months(hw_model, ridge_resid, df_mensuel: pd.DataFrame, months_ahead: int, meta: dict) -> pd.DataFrame:
-    """
-    Hybride = base HW + resid_hat ; resid_hat prédit par ridge_resid.
-    Le ridge hybride attend (dans ton meta):
-      ["lag_1","lag_12","roll_mean_3","resid_hw_lag_1","resid_hw_lag_12"] (exemple)
-    """
     history_y = df_mensuel.copy()
     last_date = history_y.index.max().to_period("M").to_timestamp()
     start_future = (last_date.to_period("M") + 1).to_timestamp()
     future_index = pd.date_range(start=start_future, periods=months_ahead, freq="MS")
 
-    # base HW fixe sur l'horizon
     base_hw = _hw_forecast(hw_model, steps=months_ahead, future_index=future_index)
 
-    # resid historique = y - fitted
-    hw_fitted = _get_hw_fittedvalues(hw_model, history_y.index)
-    resid_hist = (history_y["tonnage"] - hw_fitted).astype(float)
+    # ---- reconstruire résidus sur l'historique
+    hw_fit_aligned = _get_hw_fittedvalues_aligned(hw_model, history_y.index)
+    resid_hist = (history_y["tonnage"] - hw_fit_aligned).astype(float)
 
-    # ⚠️ éviter NaN au début: on remplit par 0 (ou moyenne) si fittedvalues donne NaN
-    resid_hist = resid_hist.replace([np.inf, -np.inf], np.nan)
+    # IMPORTANT: au début, fittedvalues peut être NaN => resid NaN.
+    # on remplit pour pouvoir construire lag_12 etc.
+    resid_hist = resid_hist.fillna(method="bfill").fillna(method="ffill")
     if resid_hist.isna().any():
-        resid_hist = resid_hist.fillna(0.0)
+        raise ValueError("Impossible de reconstruire les résidus (NaN persistants). Vérifie que HW a été fit sur la même série mensuelle.")
 
     history_resid = resid_hist.copy()
 
-    # features attendues
-    features = meta.get("features_resid_hw") or meta.get("features_resid") or meta.get("features")
-    if not features:
-        raise ValueError("Meta hybride ne contient pas features_resid_hw / features_resid / features.")
+    features_resid = meta.get("features_resid", None)
+    if not features_resid:
+        raise ValueError("meta.json hybride ne contient pas 'features_resid' (ou 'features_resid_hw').")
 
-    # diagnostics
-    st.caption(f"Features résidus (meta): {features}")
+    st.caption(f"Features résidus (meta): {features_resid}")
 
     preds = []
     for d in future_index:
@@ -249,55 +252,59 @@ def hw_ridge_forecast_next_months(hw_model, ridge_resid, df_mensuel: pd.DataFram
 
         feat = {}
 
-        # --- Features sur tonnage (lag / rolling)
-        if "lag_1" in features:
+        # ---- variables "tonnage lags" si présentes dans meta (comme chez toi)
+        if "lag_1" in features_resid:
             feat["lag_1"] = float(history_y.loc[p1, "tonnage"]) if p1 in history_y.index else float(history_y["tonnage"].iloc[-1])
 
-        if "lag_12" in features:
+        if "lag_12" in features_resid:
             if p12 in history_y.index:
                 feat["lag_12"] = float(history_y.loc[p12, "tonnage"])
             else:
-                feat["lag_12"] = _safe_mean(history_y["tonnage"], 12, default=float(history_y["tonnage"].iloc[-1]))
+                feat["lag_12"] = float(history_y["tonnage"].tail(12).mean())
 
-        if "roll_mean_3" in features:
+        if "roll_mean_3" in features_resid:
             vals = [float(history_y.loc[x, "tonnage"]) for x in [p1, p2, p3] if x in history_y.index]
-            feat["roll_mean_3"] = float(np.mean(vals)) if len(vals) == 3 else _safe_mean(history_y["tonnage"], 3, default=float(history_y["tonnage"].iloc[-1]))
+            feat["roll_mean_3"] = float(np.mean(vals)) if len(vals) == 3 else float(history_y["tonnage"].tail(3).mean())
 
-        # --- Features sur résidus
-        if "resid_hw_lag_1" in features:
+        # ---- variables "resid lags"
+        if "resid_hw_lag_1" in features_resid:
             feat["resid_hw_lag_1"] = float(history_resid.loc[p1]) if p1 in history_resid.index else float(history_resid.iloc[-1])
 
-        if "resid_hw_lag_12" in features:
+        if "resid_hw_lag_12" in features_resid:
             if p12 in history_resid.index:
                 feat["resid_hw_lag_12"] = float(history_resid.loc[p12])
             else:
-                feat["resid_hw_lag_12"] = _safe_mean(history_resid, 12, default=float(history_resid.iloc[-1]))
+                feat["resid_hw_lag_12"] = float(history_resid.tail(12).mean())
 
-        # vérif complet
-        missing_feats = [f for f in features if f not in feat]
+        # si d'autres features existent, tu les ajoutes ici (sin/cos, etc.)
+
+        missing_feats = [f for f in features_resid if f not in feat]
         if missing_feats:
-            raise ValueError(f"Features attendues mais non construites: {missing_feats}")
+            raise ValueError(
+                "Features attendues par le Ridge résidu mais non construites dans l'app: "
+                f"{missing_feats}. Mets à jour hw_hybrid_meta.json ou ajoute leur calcul."
+            )
 
-        X_resid = pd.DataFrame([feat], index=[d])[features]
+        X_resid = pd.DataFrame([feat], index=[d])[features_resid]
 
-        # sécurité NaN
+        # sécurité anti-NaN
         if X_resid.isna().any().any():
-            # on remplace par des valeurs de secours (moyennes)
-            X_resid = X_resid.fillna(0.0)
+            raise ValueError(
+                f"Input X contains NaN pour la date {d:%Y-%m}. "
+                "Cause probable: pas assez d'historique pour les lags (12 mois) ou résidus mal reconstruits."
+            )
 
         resid_hat = float(ridge_resid.predict(X_resid)[0])
         yhat = float(base_hw.loc[d] + resid_hat)
-
         preds.append(yhat)
 
-        # mise à jour récursive (pour les lags futurs)
+        # mise à jour récursive
         history_y.loc[d, "tonnage"] = yhat
         history_resid.loc[d] = resid_hat
 
     out = pd.DataFrame({"date_mois": future_index, "prediction_tonnage": preds})
     out["date_mois_str"] = out["date_mois"].dt.strftime("%Y-%m")
     return out
-
 
 # ============================================================
 # SIDEBAR
@@ -307,10 +314,8 @@ with st.sidebar:
     model_choice = st.selectbox("Modèle", ["Ridge (joblib)", "Hybride Holt-Winters + Ridge (joblib)"])
     uploaded = st.file_uploader("Charge le fichier Excel (.xlsx)", type=["xlsx"])
     target_year = st.number_input("Année à prédire", min_value=2025, max_value=2100, value=2027, step=1)
-
     st.divider()
     st.caption("Feuille attendue: 'Feuil1'. Colonnes attendues: Année, Mois, Somme de Tonne (au minimum).")
-
 
 # ============================================================
 # APP FLOW
@@ -357,19 +362,19 @@ except Exception as e:
     st.error(f"❌ Impossible de charger / utiliser le modèle: {e}")
     st.stop()
 
-# Extraire uniquement Jan..Dec de l'année cible (12 mois garantis)
+# Extraire Jan..Dec année cible
 target_months = pd.date_range(start=f"{int(target_year)}-01-01", end=f"{int(target_year)}-12-01", freq="MS")
-pred_year = pred_all.set_index("date_mois").reindex(target_months)
+pred_year = (
+    pred_all.set_index("date_mois")
+            .reindex(target_months)
+            .reset_index()
+            .rename(columns={"index": "date_mois"})
+)
+pred_year["date_mois_str"] = pred_year["date_mois"].dt.strftime("%Y-%m")
 
 missing = pred_year["prediction_tonnage"].isna().sum()
 if missing > 0:
-    st.warning(
-        f"⚠️ Il manque {missing} mois sur {target_year}. "
-        f"Vérifie que l'horizon va bien jusqu'à {end_target:%Y-%m}."
-    )
-
-pred_year = pred_year.reset_index().rename(columns={"index": "date_mois"})
-pred_year["date_mois_str"] = pred_year["date_mois"].dt.strftime("%Y-%m")
+    st.warning(f"⚠️ Il manque {missing} mois sur {target_year}. Vérifie l'horizon calculé et l'historique chargé.")
 
 c1, c2 = st.columns([1.2, 1])
 
