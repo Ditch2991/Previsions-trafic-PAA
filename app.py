@@ -203,69 +203,87 @@ def _hw_forecast(hw_model, steps: int, future_index: pd.DatetimeIndex) -> pd.Ser
 
 def hw_ridge_forecast_next_months(hw_model, ridge_resid, df_mensuel: pd.DataFrame, months_ahead: int, meta: dict) -> pd.DataFrame:
     """
-    Hybride = base HW + Ridge(residus).
-    Ton meta indique:
-      features_resid_hw = ["lag_1","lag_12","roll_mean_3","resid_hw_lag_1","resid_hw_lag_12"]
-    => On doit construire exactement ces colonnes avant predict().
+    Hybride = base Holt-Winters + résidu prédit (Ridge).
+    meta["features_resid_hw"] contient les features utilisées à l'entraînement.
     """
-    # --- Préparer horizon
     history_y = df_mensuel.copy()
+    history_y = history_y.sort_index()
+
     last_date = history_y.index.max().to_period("M").to_timestamp()
     start_future = (last_date.to_period("M") + 1).to_timestamp()
     future_index = pd.date_range(start=start_future, periods=months_ahead, freq="MS")
 
-    # --- 1) Base Holt-Winters sur tout l'horizon
+    # 1) Forecast HW (base)
     base_hw = _hw_forecast(hw_model, steps=months_ahead, future_index=future_index)
 
-    # --- 2) Résidus historiques = y - hw_fittedvalues (aligné)
+    # 2) Résidus historiques = y - fittedvalues
     hw_fitted = _get_hw_fittedvalues(hw_model, history_y.index)
+
     resid_hist = (history_y["tonnage"] - hw_fitted).astype(float)
+
+    # ✅ IMPORTANT: rendre les résidus exploitables (pas de NaN)
+    # - bfill/ffill pour remplir les trous initiaux éventuels
+    # - puis, si ça reste NaN (série trop courte), remplacer par 0
+    resid_hist = resid_hist.replace([np.inf, -np.inf], np.nan)
+    resid_hist = resid_hist.bfill().ffill().fillna(0.0)
+
+    # Série résidus qui va être enrichie récursivement
     history_resid = resid_hist.copy()
 
-    # --- Features attendues (depuis meta)
-    features = meta.get("features_resid_hw", meta.get("features_resid", None))
-    if not features:
-        raise ValueError("Meta hybride: clé 'features_resid_hw' introuvable (ou vide).")
+    # 3) Features attendues par Ridge résidus
+    features_resid = meta.get("features_resid_hw") or meta.get("features_resid") or meta.get("features") or []
+    if not features_resid:
+        # fallback
+        features_resid = ["lag_1", "lag_12", "roll_mean_3", "resid_hw_lag_1", "resid_hw_lag_12"]
+
+    # (Optionnel) affiche pour debug
+    st.write("Features résidus (meta):", features_resid)
 
     preds = []
     for d in future_index:
-        # indices passés
         p1 = (d.to_period("M") - 1).to_timestamp()
         p2 = (d.to_period("M") - 2).to_timestamp()
         p3 = (d.to_period("M") - 3).to_timestamp()
         p12 = (d.to_period("M") - 12).to_timestamp()
 
-        # --- Features tonnage (lag_1, lag_12, roll_mean_3)
-        lag_1 = float(history_y.loc[p1, "tonnage"]) if p1 in history_y.index else float(history_y["tonnage"].iloc[-1])
-        lag_12 = float(history_y.loc[p12, "tonnage"]) if p12 in history_y.index else float(history_y["tonnage"].tail(12).mean())
-        vals_y = [float(history_y.loc[x, "tonnage"]) for x in [p1, p2, p3] if x in history_y.index]
-        roll_mean_3 = float(np.mean(vals_y)) if len(vals_y) == 3 else float(history_y["tonnage"].tail(3).mean())
+        feat = {}
 
-        # --- Features résidus (resid_hw_lag_1, resid_hw_lag_12)
-        resid_hw_lag_1 = float(history_resid.loc[p1]) if p1 in history_resid.index else float(history_resid.iloc[-1])
-        resid_hw_lag_12 = float(history_resid.loc[p12]) if p12 in history_resid.index else float(history_resid.tail(12).mean())
+        # --- Features sur tonnage (si présentes dans meta)
+        if "lag_1" in features_resid:
+            feat["lag_1"] = float(history_y.loc[p1, "tonnage"]) if p1 in history_y.index else float(history_y["tonnage"].iloc[-1])
 
-        row = {
-            "lag_1": lag_1,
-            "lag_12": lag_12,
-            "roll_mean_3": roll_mean_3,
-            "resid_hw_lag_1": resid_hw_lag_1,
-            "resid_hw_lag_12": resid_hw_lag_12,
-        }
+        if "lag_12" in features_resid:
+            if p12 in history_y.index:
+                feat["lag_12"] = float(history_y.loc[p12, "tonnage"])
+            else:
+                feat["lag_12"] = float(history_y["tonnage"].tail(12).mean())
 
-        # --- construire X dans le même ordre/nommage que durant le fit
-        missing_feats = [f for f in features if f not in row]
-        if missing_feats:
-            raise ValueError(f"Features attendues par Ridge résidus mais non construites: {missing_feats}")
+        if "roll_mean_3" in features_resid:
+            vals_y = [float(history_y.loc[x, "tonnage"]) for x in [p1, p2, p3] if x in history_y.index]
+            feat["roll_mean_3"] = float(np.mean(vals_y)) if len(vals_y) == 3 else float(history_y["tonnage"].tail(3).mean())
 
-        X_resid = pd.DataFrame([row], index=[d])[features]
+        # --- Features sur résidus (si présentes dans meta)
+        if "resid_hw_lag_1" in features_resid:
+            v = history_resid.loc[p1] if p1 in history_resid.index else history_resid.iloc[-1]
+            feat["resid_hw_lag_1"] = float(0.0 if pd.isna(v) else v)
+
+        if "resid_hw_lag_12" in features_resid:
+            if p12 in history_resid.index:
+                v = history_resid.loc[p12]
+            else:
+                v = history_resid.tail(12).mean()
+            feat["resid_hw_lag_12"] = float(0.0 if pd.isna(v) else v)
+
+        # ✅ Protection finale contre NaN (sécurité)
+        X_resid = pd.DataFrame([feat], index=[d])[features_resid]
+        X_resid = X_resid.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
         resid_hat = float(ridge_resid.predict(X_resid)[0])
-
-        # --- hybride final
         yhat = float(base_hw.loc[d] + resid_hat)
+
         preds.append(yhat)
 
-        # --- mise à jour récursive
+        # Mise à jour récursive
         history_y.loc[d, "tonnage"] = yhat
         history_resid.loc[d] = resid_hat
 
