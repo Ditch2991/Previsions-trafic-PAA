@@ -5,6 +5,7 @@ import numpy as np
 import joblib
 import json
 from pathlib import Path
+from io import BytesIO
 
 # ============================================================
 # CONFIG STREAMLIT
@@ -85,14 +86,52 @@ def load_excel_and_build_monthly_series(file):
           .to_frame()
           .sort_index()
     )
-
-    # index = début de mois (MS)
-    df_mensuel.index = df_mensuel.index.to_period("M").to_timestamp()
+    df_mensuel.index = df_mensuel.index.to_period("M").to_timestamp()  # MS
 
     return df, df_mensuel
 
 def months_between_exclusive(start_month: pd.Timestamp, end_month: pd.Timestamp) -> int:
     return (end_month.to_period("M") - start_month.to_period("M")).n
+
+# ============================================================
+# UI HELPERS
+# ============================================================
+def show_model_performance_badge(model_choice: str):
+    # Tu peux changer ces valeurs quand tu veux
+    if model_choice.startswith("Ridge"):
+        pct = 97
+        label = "Performance du modèle (2024)"
+    else:
+        pct = 96
+        label = "Performance du modèle (2024)"
+
+    st.markdown(
+        f"""
+        <div style="
+            padding: 14px 16px;
+            border-radius: 12px;
+            border: 1px solid rgba(255,255,255,0.15);
+            background: rgba(255,255,255,0.04);
+            margin: 6px 0 10px 0;
+        ">
+          <div style="font-size: 16px; font-weight: 700; margin-bottom: 2px;">
+            {label}
+          </div>
+          <div style="font-size: 18px;">
+            <span style="font-weight: 700;">{pct}%</span>
+            <span style="color:#ff4b4b; font-weight: 800;">&nbsp;sur les données de 2024</span>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+def dataframe_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "predictions") -> bytes:
+    output = BytesIO()
+    # xlsxwriter est souvent dispo; sinon openpyxl. On force openpyxl pour stabilité.
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name=sheet_name)
+    return output.getvalue()
 
 # ============================================================
 # MODEL LOADING
@@ -124,8 +163,7 @@ def load_hw_ridge_artifacts():
     missing = [p for p in [hw_model_path, ridge_resid_path, meta_path] if not p.exists()]
     if missing:
         raise FileNotFoundError(
-            f"Artefacts Hybride manquants dans: {folder}\n"
-            + "\n".join([f"- {p}" for p in missing])
+            f"Artefacts Hybride manquants dans: {folder}\n" + "\n".join([f"- {p}" for p in missing])
         )
 
     hw_model = joblib.load(hw_model_path)
@@ -178,34 +216,27 @@ def _as_series(x):
     return pd.Series(x)
 
 def _get_hw_fittedvalues_aligned(hw_model, history_index: pd.DatetimeIndex) -> pd.Series:
-    """
-    Aligne fittedvalues HW sur l'index de df_mensuel sans erreur de longueur.
-    - Si fittedvalues a déjà un index daté: on reindex dessus.
-    - Sinon (array): on aligne sur la FIN de l'historique (valeurs généralement disponibles après init).
-    """
     if not hasattr(hw_model, "fittedvalues"):
         raise ValueError("Le modèle Holt-Winters chargé ne contient pas 'fittedvalues'.")
 
     fv = _as_series(hw_model.fittedvalues)
 
-    # Cas 1: fittedvalues indexé par dates -> reindex direct
+    # Cas 1: index daté
     if isinstance(fv.index, (pd.DatetimeIndex, pd.PeriodIndex)):
         if isinstance(fv.index, pd.PeriodIndex):
             fv.index = fv.index.to_timestamp()
         fv = fv.sort_index()
         return fv.reindex(history_index)
 
-    # Cas 2: fittedvalues sans index (RangeIndex) -> aligner sur la fin
+    # Cas 2: array (RangeIndex) -> aligner sur la fin
     fv_values = fv.values.astype(float)
     n = len(fv_values)
     m = len(history_index)
 
     if n > m:
-        # garder les m dernières
         fv_values = fv_values[-m:]
         n = m
 
-    # on place ces n valeurs sur les n derniers mois de history_index
     aligned = pd.Series(index=history_index, dtype=float)
     aligned.iloc[m - n:] = fv_values
     return aligned
@@ -225,13 +256,10 @@ def hw_ridge_forecast_next_months(hw_model, ridge_resid, df_mensuel: pd.DataFram
 
     base_hw = _hw_forecast(hw_model, steps=months_ahead, future_index=future_index)
 
-    # ---- reconstruire résidus sur l'historique
     hw_fit_aligned = _get_hw_fittedvalues_aligned(hw_model, history_y.index)
     resid_hist = (history_y["tonnage"] - hw_fit_aligned).astype(float)
 
-    # IMPORTANT: au début, fittedvalues peut être NaN => resid NaN.
-    # on remplit pour pouvoir construire lag_12 etc.
-    resid_hist = resid_hist.fillna(method="bfill").fillna(method="ffill")
+    resid_hist = resid_hist.bfill().ffill()
     if resid_hist.isna().any():
         raise ValueError("Impossible de reconstruire les résidus (NaN persistants). Vérifie que HW a été fit sur la même série mensuelle.")
 
@@ -240,8 +268,6 @@ def hw_ridge_forecast_next_months(hw_model, ridge_resid, df_mensuel: pd.DataFram
     features_resid = meta.get("features_resid", None)
     if not features_resid:
         raise ValueError("meta.json hybride ne contient pas 'features_resid' (ou 'features_resid_hw').")
-
-    st.caption(f"Features résidus (meta): {features_resid}")
 
     preds = []
     for d in future_index:
@@ -252,53 +278,33 @@ def hw_ridge_forecast_next_months(hw_model, ridge_resid, df_mensuel: pd.DataFram
 
         feat = {}
 
-        # ---- variables "tonnage lags" si présentes dans meta (comme chez toi)
+        # features tonnage
         if "lag_1" in features_resid:
             feat["lag_1"] = float(history_y.loc[p1, "tonnage"]) if p1 in history_y.index else float(history_y["tonnage"].iloc[-1])
-
         if "lag_12" in features_resid:
-            if p12 in history_y.index:
-                feat["lag_12"] = float(history_y.loc[p12, "tonnage"])
-            else:
-                feat["lag_12"] = float(history_y["tonnage"].tail(12).mean())
-
+            feat["lag_12"] = float(history_y.loc[p12, "tonnage"]) if p12 in history_y.index else float(history_y["tonnage"].tail(12).mean())
         if "roll_mean_3" in features_resid:
             vals = [float(history_y.loc[x, "tonnage"]) for x in [p1, p2, p3] if x in history_y.index]
             feat["roll_mean_3"] = float(np.mean(vals)) if len(vals) == 3 else float(history_y["tonnage"].tail(3).mean())
 
-        # ---- variables "resid lags"
+        # features résidus
         if "resid_hw_lag_1" in features_resid:
             feat["resid_hw_lag_1"] = float(history_resid.loc[p1]) if p1 in history_resid.index else float(history_resid.iloc[-1])
-
         if "resid_hw_lag_12" in features_resid:
-            if p12 in history_resid.index:
-                feat["resid_hw_lag_12"] = float(history_resid.loc[p12])
-            else:
-                feat["resid_hw_lag_12"] = float(history_resid.tail(12).mean())
-
-        # si d'autres features existent, tu les ajoutes ici (sin/cos, etc.)
+            feat["resid_hw_lag_12"] = float(history_resid.loc[p12]) if p12 in history_resid.index else float(history_resid.tail(12).mean())
 
         missing_feats = [f for f in features_resid if f not in feat]
         if missing_feats:
-            raise ValueError(
-                "Features attendues par le Ridge résidu mais non construites dans l'app: "
-                f"{missing_feats}. Mets à jour hw_hybrid_meta.json ou ajoute leur calcul."
-            )
+            raise ValueError(f"Features attendues par le Ridge résidu mais non construites dans l'app: {missing_feats}")
 
         X_resid = pd.DataFrame([feat], index=[d])[features_resid]
-
-        # sécurité anti-NaN
         if X_resid.isna().any().any():
-            raise ValueError(
-                f"Input X contains NaN pour la date {d:%Y-%m}. "
-                "Cause probable: pas assez d'historique pour les lags (12 mois) ou résidus mal reconstruits."
-            )
+            raise ValueError(f"Input X contains NaN pour la date {d:%Y-%m}. Pas assez d'historique pour les lags (12 mois) ou résidus mal reconstruits.")
 
         resid_hat = float(ridge_resid.predict(X_resid)[0])
         yhat = float(base_hw.loc[d] + resid_hat)
         preds.append(yhat)
 
-        # mise à jour récursive
         history_y.loc[d, "tonnage"] = yhat
         history_resid.loc[d] = resid_hat
 
@@ -329,6 +335,9 @@ try:
 except Exception as e:
     st.error(f"Erreur Excel: {e}")
     st.stop()
+
+# ✅ Bandeau perf bien visible (juste au-dessus de la série mensuelle)
+show_model_performance_badge(model_choice)
 
 st.subheader("🧾 Série mensuelle (tonnage total)")
 hist_show = df_mensuel.copy()
@@ -382,8 +391,19 @@ with c1:
     st.subheader(f"📋 Prédictions — {int(target_year)}")
     st.dataframe(pred_year[["date_mois_str", "prediction_tonnage"]], use_container_width=True)
 
-    csv_bytes = pred_year[["date_mois_str", "prediction_tonnage"]].to_csv(index=False).encode("utf-8")
-    st.download_button("⬇️ Télécharger (CSV)", data=csv_bytes, file_name=f"predictions_{int(target_year)}.csv", mime="text/csv")
+    # ✅ export Excel au lieu de CSV
+    export_df = pred_year[["date_mois_str", "prediction_tonnage"]].copy()
+    export_df = export_df.rename(columns={
+        "date_mois_str": "mois",
+        "prediction_tonnage": "tonnage_predit"
+    })
+    excel_bytes = dataframe_to_excel_bytes(export_df, sheet_name=f"pred_{int(target_year)}")
+    st.download_button(
+        "⬇️ Télécharger (Excel .xlsx)",
+        data=excel_bytes,
+        file_name=f"predictions_{int(target_year)}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
 
 with c2:
     st.subheader("📉 Courbe des prédictions")
